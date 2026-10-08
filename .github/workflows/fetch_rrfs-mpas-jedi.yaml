@@ -1,0 +1,64 @@
+name: Sync rrfs-mpas-jedi with upstream
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+      timezone: America/New_York
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-rrfs-mpas-jedi
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_BRANCH: rrfs-mpas-jedi
+
+    steps:
+      - name: Check out rrfs-mpas-jedi
+        uses: actions/checkout@v5
+        with:
+          ref: rrfs-mpas-jedi
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NOAA-EMC/rrfs-workflow.git
+          git fetch --no-tags upstream "refs/heads/${TARGET_BRANCH}"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream is already merged; nothing to sync."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git merge --no-edit "$upstream_sha"; then
+            git merge --abort
+            echo "::error::Upstream merge failed; resolve conflicts manually. No changes pushed."
+            exit 1
+          fi
+
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Request updated superyamls
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run publish-superyamls.yaml --ref "$TARGET_BRANCH"
