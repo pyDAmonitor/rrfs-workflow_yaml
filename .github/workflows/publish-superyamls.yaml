@@ -1,0 +1,149 @@
+name: Publish superyamls
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-superyamls
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      SOURCE_REF: ${{ github.ref }}
+      JEDI_POLYGON_FILTER: 'TRUE'
+
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install YAML tools
+        run: python -m pip install yamltools4jedi==0.2.4
+
+      - name: Generate conus3km YAMLs and update jedivar satellite anchors
+        working-directory: source/parm
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          import tempfile
+
+          import hifiyaml as hy
+          import yamltools4jedi as yj
+
+          source = Path.cwd().parent
+          sys.path.insert(0, str(source / "workflow/rocoto_funcs"))
+          from smart_superyaml import smart_superyaml
+
+          for yaml_type in ("jedivar", "getkf"):
+              smart_superyaml(str(source), yaml_type, "conus3km")
+
+          with tempfile.TemporaryDirectory() as satinfo_directory:
+              shutil.copyfile(
+                  source / "fix/jedi/satinfo.rrfs",
+                  Path(satinfo_directory) / "satinfo",
+              )
+              original_directory = Path.cwd()
+              try:
+                  os.chdir(satinfo_directory)
+                  satellite_info = yj.load_satinfo()
+              finally:
+                  os.chdir(original_directory)
+          if not satellite_info:
+              raise RuntimeError("Missing or empty satellite information")
+
+          data = hy.load(str(source / "parm/jedivar.yaml"))
+          output = []
+          cursor = 0
+          updated_observers = 0
+          observers = yj.get_all_obs(data, shallow=True)
+          for observer in sorted(observers.values(), key=lambda item: item["pos1"]):
+              output.extend(data[cursor:observer["pos1"]])
+              block = data[observer["pos1"]:observer["pos2"]]
+              if observer["is_sat_radiance"] and observer["sname"] in satellite_info:
+                  yj.update_sat_anchors(block, satellite_info)
+                  updated_observers += 1
+              output.extend(block)
+              cursor = observer["pos2"]
+          output.extend(data[cursor:])
+          if updated_observers == 0:
+              raise RuntimeError("No satellite observers matched satinfo")
+
+          destination = Path(os.environ["RUNNER_TEMP"]) / "superyamls-generated"
+          destination.mkdir(parents=True, exist_ok=True)
+          hy.dump(output, fpath=str(destination / "jedivar.yaml"))
+          shutil.copyfile(source / "parm/getkf.yaml", destination / "getkf.yaml")
+          print(f"Updated satellite anchors in {updated_observers} jedivar observers")
+          for filename in ("jedivar.yaml", "getkf.yaml"):
+              if (destination / filename).stat().st_size == 0:
+                  raise RuntimeError(f"Generated {filename} is empty")
+          PY
+
+      - name: Commit changed YAMLs to superyamls
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish_dir="${RUNNER_TEMP}/superyamls-publish"
+          generated_dir="${RUNNER_TEMP}/superyamls-generated"
+
+          if git ls-remote --exit-code --heads origin refs/heads/superyamls; then
+            git fetch --no-tags origin \
+              refs/heads/superyamls:refs/remotes/origin/superyamls
+            git worktree add --detach "$publish_dir" refs/remotes/origin/superyamls
+            unexpected_files=$(git -C "$publish_dir" ls-files -- \
+              ':!:jedivar.yaml' ':!:getkf.yaml')
+            if [[ -n "$unexpected_files" ]]; then
+              echo "::error::superyamls contains files other than the two YAML outputs"
+              exit 1
+            fi
+          else
+            exit_code=$?
+            if [[ "$exit_code" -ne 2 ]]; then
+              exit "$exit_code"
+            fi
+            git worktree add --detach "$publish_dir" HEAD
+            git -C "$publish_dir" switch --orphan superyamls
+          fi
+
+          cp "$generated_dir/jedivar.yaml" "$publish_dir/jedivar.yaml"
+          cp "$generated_dir/getkf.yaml" "$publish_dir/getkf.yaml"
+          git -C "$publish_dir" add -- jedivar.yaml getkf.yaml
+          if git -C "$publish_dir" diff --cached --quiet; then
+            echo "Generated YAMLs are unchanged; nothing to publish."
+            exit 0
+          fi
+
+          latest_source=$(git ls-remote --exit-code --heads origin \
+            "$SOURCE_REF" | cut -f1)
+          if [[ "$latest_source" != "$SOURCE_SHA" ]]; then
+            echo "Source branch has advanced; skipping this superseded run."
+            exit 0
+          fi
+
+          git -C "$publish_dir" config user.name 'github-actions[bot]'
+          git -C "$publish_dir" config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$publish_dir" commit -m "Update superyamls from ${SOURCE_SHA}"
+          git -C "$publish_dir" push origin HEAD:refs/heads/superyamls
